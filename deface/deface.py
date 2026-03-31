@@ -4,7 +4,7 @@ import argparse
 import json
 import mimetypes
 import os
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import tqdm
 import skimage.draw
@@ -13,10 +13,131 @@ import imageio
 import imageio.v2 as iio
 import imageio.plugins.ffmpeg
 import cv2
+from insightface.app import FaceAnalysis
 
-from deface import __version__
 from deface.centerface import CenterFace
 
+# importlib.metadata is used to fetch the package version without causing a circular import
+import importlib.metadata
+
+
+# ---------------------------------------------------------------------------
+# Allowed-face helpers
+# ---------------------------------------------------------------------------
+
+def build_face_app():
+    """
+    Returns (app, rec_model):
+    - app: FaceAnalysis used for reference image embedding at startup
+    - rec_model: the recognition model used directly on crops at runtime,
+      bypassing InsightFace's internal detector (which fails on small crops)
+    """
+    import os
+    import insightface.model_zoo as model_zoo
+
+    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+
+    # Find the recognition model that was downloaded as part of buffalo_l
+    rec_model = None
+    for model in app.models.values():
+        if hasattr(model, 'taskname') and model.taskname == 'recognition':
+            rec_model = model
+            break
+
+    if rec_model is None:
+        raise RuntimeError('[allow-list] Could not find recognition model in buffalo_l pack.')
+
+    return app, rec_model
+
+
+def build_allowed_embeddings(
+    allowed_faces_dir: str,
+    face_app: FaceAnalysis,
+    rec_model,
+) -> Optional[np.ndarray]:
+    """
+    Load every image in *allowed_faces_dir*, extract one face embedding per
+    image, and return an array of shape (N, 512).  Returns None if the
+    directory is empty or no faces are found.
+    """
+    if not allowed_faces_dir or not os.path.isdir(allowed_faces_dir):
+        return None
+
+    embeddings = []
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    paths = [
+        os.path.join(allowed_faces_dir, f)
+        for f in os.listdir(allowed_faces_dir)
+        if os.path.splitext(f)[1].lower() in exts
+    ]
+
+    if not paths:
+        print(f'[allow-list] No images found in {allowed_faces_dir}')
+        return None
+
+    for p in paths:
+        img = cv2.imread(p)  # InsightFace expects BGR
+        if img is None:
+            print(f'[allow-list] Could not read {p}, skipping.')
+            continue
+        faces = face_app.get(img)
+        if not faces:
+            print(f'[allow-list] No face detected in {p}, skipping.')
+            continue
+        # Use the largest detected face, crop and embed via rec_model directly
+        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+        crop = cv2.resize(img[y1:y2, x1:x2], (112, 112))
+        emb = rec_model.get_feat(crop)
+        emb = (emb / np.linalg.norm(emb)).flatten()
+        embeddings.append(emb)
+        print(f'[allow-list] Loaded reference face from {os.path.basename(p)}')
+
+    if not embeddings:
+        print('[allow-list] Warning: no usable reference faces found.')
+        return None
+
+    return np.stack(embeddings)  # (N, 512)
+
+
+def is_allowed_face(
+    face_crop: np.ndarray,
+    allowed_embeddings: np.ndarray,
+    rec_model,
+    threshold: float = 0.4,
+    verbose: bool = False,
+) -> bool:
+    """
+    Return True if *face_crop* (H×W×3 uint8 RGB) matches any allowed face.
+    Uses the recognition model directly on the crop — bypasses InsightFace's
+    internal detector, which fails on small or tight crops.
+    """
+    if face_crop.size == 0:
+        return False
+
+    # InsightFace expects BGR; frame is RGB (imageio convention)
+    bgr_crop = face_crop[:, :, ::-1].copy()
+
+    # Recognition model expects 112x112
+    resized = cv2.resize(bgr_crop, (112, 112))
+
+    emb = rec_model.get_feat(resized)  # (1, 512)
+    emb = emb / np.linalg.norm(emb)   # normalise to unit vector
+    emb = emb.flatten()               # (512,)
+
+    sims = allowed_embeddings @ emb
+    best = float(sims.max())
+    if verbose:
+        print(f'[allow-list] Best similarity: {best:.3f} (threshold: {threshold}) → {"ALLOW" if best > threshold else "BLUR"}')
+    return best > threshold
+
+
+# ---------------------------------------------------------------------------
+# Original helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     s = mask_scale - 1.0
@@ -34,21 +155,23 @@ def draw_det(
         ellipse: bool = True,
         draw_scores: bool = False,
         ovcolor: Tuple[int] = (0, 0, 0),
-        replaceimg = None,
+        replaceimg=None,
         mosaicsize: int = 20
 ):
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
-        bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
-        blurred_box =  cv2.blur(
+        bf = 2
+        blurred_box = cv2.blur(
             frame[y1:y2, x1:x2],
             (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
         )
         if ellipse:
             roibox = frame[y1:y2, x1:x2]
-            # Get y and x coordinate lists of the "bounding ellipse"
-            ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
+            ey, ex = skimage.draw.ellipse(
+                (y2 - y1) // 2, (x2 - x1) // 2,
+                (y2 - y1) // 2, (x2 - x1) // 2
+            )
             roibox[ey, ex] = blurred_box[ey, ex]
             frame[y1:y2, x1:x2] = roibox
         else:
@@ -56,10 +179,13 @@ def draw_det(
     elif replacewith == 'img':
         target_size = (x2 - x1, y2 - y1)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
-        if replaceimg.shape[2] == 3:  # RGB
+        if replaceimg.shape[2] == 3:
             frame[y1:y2, x1:x2] = resized_replaceimg
-        elif replaceimg.shape[2] == 4:  # RGBA
-            frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2] * (1 - resized_replaceimg[:, :, 3:] / 255) + resized_replaceimg[:, :, :3] * (resized_replaceimg[:, :, 3:] / 255)
+        elif replaceimg.shape[2] == 4:
+            frame[y1:y2, x1:x2] = (
+                frame[y1:y2, x1:x2] * (1 - resized_replaceimg[:, :, 3:] / 255)
+                + resized_replaceimg[:, :, :3] * (resized_replaceimg[:, :, 3:] / 255)
+            )
     elif replacewith == 'mosaic':
         for y in range(y1, y2, mosaicsize):
             for x in range(x1, x2, mosaicsize):
@@ -69,6 +195,7 @@ def draw_det(
                 cv2.rectangle(frame, pt1, pt2, color, -1)
     elif replacewith == 'none':
         pass
+
     if draw_scores:
         cv2.putText(
             frame, f'{score:.2f}', (x1 + 0, y1 - 20),
@@ -76,17 +203,40 @@ def draw_det(
         )
 
 
+# ---------------------------------------------------------------------------
+# Core anonymization — now allow-list aware
+# ---------------------------------------------------------------------------
+
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
+        # new allow-list params (all optional — backwards compatible)
+        allowed_embeddings: Optional[np.ndarray] = None,
+        rec_model=None,
+        allow_threshold: float = 0.4,
+        verbose: bool = False,
 ):
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
         x1, y1, x2, y2 = boxes.astype(int)
+
+        # --- allow-list check on unscaled box ---------------------------
+        if allowed_embeddings is not None:
+            rx1 = max(0, x1)
+            ry1 = max(0, y1)
+            rx2 = min(frame.shape[1] - 1, x2)
+            ry2 = min(frame.shape[0] - 1, y2)
+            face_crop = frame[ry1:ry2, rx1:rx2]
+            if is_allowed_face(
+                face_crop, allowed_embeddings, rec_model, allow_threshold, verbose
+            ):
+                continue  # skip — this is an allowed face
+        # ----------------------------------------------------------------
+
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
-        # Clip bb coordinates to valid frame region
         y1, y2 = max(0, y1), min(frame.shape[0] - 1, y2)
         x1, x2 = max(0, x1), min(frame.shape[1] - 1, x2)
+
         draw_det(
             frame, score, i, x1, y1, x2, y2,
             replacewith=replacewith,
@@ -96,6 +246,10 @@ def anonymize_frame(
             mosaicsize=mosaicsize
         )
 
+
+# ---------------------------------------------------------------------------
+# Video / image detection (unchanged signatures, new kwargs forwarded)
+# ---------------------------------------------------------------------------
 
 def cam_read_iter(reader):
     while True:
@@ -115,20 +269,23 @@ def video_detect(
         ellipse: bool,
         draw_scores: bool,
         ffmpeg_config: Dict[str, str],
-        replaceimg = None,
+        replaceimg=None,
         keep_audio: bool = False,
         mosaicsize: int = 20,
-        disable_progress_output = False
+        disable_progress_output=False,
+        allowed_embeddings=None,
+        rec_model=None,
+        allow_threshold: float = 0.4,
+        verbose: bool = False,
 ):
     try:
         if 'fps' in ffmpeg_config:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
+            reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
         else:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath)
-
+            reader = imageio.get_reader(ipath)
         meta = reader.get_meta_data()
         _ = meta['size']
-    except:
+    except Exception:
         if cam:
             print(f'Could not find video device {ipath}. Please set a valid input.')
         else:
@@ -141,42 +298,45 @@ def video_detect(
     else:
         read_iter = reader.iter_data()
         nframes = reader.count_frames()
-    if nested:
-        bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1, leave=True, disable=disable_progress_output)
-    else:
-        bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, disable=disable_progress_output)
+
+    bar = tqdm.tqdm(
+        dynamic_ncols=True, total=nframes,
+        position=1 if nested else 0,
+        leave=True,
+        disable=disable_progress_output,
+    )
 
     if opath is not None:
         _ffmpeg_config = ffmpeg_config.copy()
-        #  If fps is not explicitly set in ffmpeg_config, use source video fps value
         _ffmpeg_config.setdefault('fps', meta['fps'])
-        # Carry over audio from input path, use "copy" codec (no transcoding) by default
         if keep_audio and meta.get('audio_codec'):
             _ffmpeg_config.setdefault('audio_path', ipath)
             _ffmpeg_config.setdefault('audio_codec', 'copy')
-        writer: imageio.plugins.ffmpeg.FfmpegFormat.Writer = imageio.get_writer(
-            opath, format='FFMPEG', mode='I', **_ffmpeg_config
-        )
+        writer = imageio.get_writer(opath, format='FFMPEG', mode='I', **_ffmpeg_config)
 
     for frame in read_iter:
-        # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
-
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
-            replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
+            replacewith=replacewith, ellipse=ellipse,
+            draw_scores=draw_scores, replaceimg=replaceimg,
+            mosaicsize=mosaicsize,
+            allowed_embeddings=allowed_embeddings,
+            rec_model=rec_model,
+            allow_threshold=allow_threshold,
+            verbose=verbose,
         )
 
         if opath is not None:
             writer.append_data(frame)
 
         if enable_preview:
-            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
-            if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
+            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])
+            if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:
                 cv2.destroyAllWindows()
                 break
         bar.update()
+
     reader.close()
     if opath is not None:
         writer.close()
@@ -194,38 +354,44 @@ def image_detect(
         draw_scores: bool,
         enable_preview: bool,
         keep_metadata: bool,
-        replaceimg = None,
+        replaceimg=None,
         mosaicsize: int = 20,
+        allowed_embeddings=None,
+        rec_model=None,
+        allow_threshold: float = 0.4,
+        verbose: bool = False,
 ):
     frame = iio.imread(ipath)
 
     if keep_metadata:
-        # Source image EXIF metadata retrieval via imageio V3 lib
         metadata = imageio.v3.immeta(ipath)
         exif_dict = metadata.get("exif", None)
 
-    # Perform network inference, get bb dets but discard landmark predictions
     dets, _ = centerface(frame, threshold=threshold)
-
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
-        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg, mosaicsize=mosaicsize
+        replacewith=replacewith, ellipse=ellipse,
+        draw_scores=draw_scores, replaceimg=replaceimg,
+        mosaicsize=mosaicsize,
+        allowed_embeddings=allowed_embeddings,
+        rec_model=rec_model,
+        allow_threshold=allow_threshold,
     )
 
     if enable_preview:
-        cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
-        if cv2.waitKey(0) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
+        cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])
+        if cv2.waitKey(0) & 0xFF in [ord('q'), 27]:
             cv2.destroyAllWindows()
 
     imageio.imsave(opath, frame)
 
     if keep_metadata:
-        # Save image with EXIF metadata
         imageio.imsave(opath, frame, exif=exif_dict)
 
-    # print(f'Output saved to {opath}')
 
+# ---------------------------------------------------------------------------
+# Misc helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def get_file_type(path):
     if path.startswith('<video'):
@@ -248,83 +414,58 @@ def get_anonymized_image(frame,
                          mask_scale: float,
                          ellipse: bool,
                          draw_scores: bool,
-                         replaceimg = None
-                         ):
-    """
-    Method for getting an anonymized image without CLI
-    returns frame
-    """
-
+                         replaceimg=None):
     centerface = CenterFace(in_shape=None, backend='auto')
     dets, _ = centerface(frame, threshold=threshold)
-
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
-        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg
+        replacewith=replacewith, ellipse=ellipse,
+        draw_scores=draw_scores, replaceimg=replaceimg,
     )
-
     return frame
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
     parser.add_argument(
         'input', nargs='*',
-        help=f'File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
+        help='File path(s) or camera device name.')
+    parser.add_argument('--output', '-o', default=None, metavar='O')
+    parser.add_argument('--thresh', '-t', default=0.2, type=float, metavar='T')
+    parser.add_argument('--scale', '-s', default=None, metavar='WxH')
+    parser.add_argument('--preview', '-p', default=False, action='store_true')
+    parser.add_argument('--boxes', default=False, action='store_true')
+    parser.add_argument('--draw-scores', default=False, action='store_true')
+    parser.add_argument('--disable-progress-output', default=False, action='store_true')
+    parser.add_argument('--mask-scale', default=1.3, type=float, metavar='M')
     parser.add_argument(
-        '--output', '-o', default=None, metavar='O',
-        help='Output file name. Defaults to input path + postfix "_anonymized".')
+        '--replacewith', default='blur',
+        choices=['blur', 'solid', 'none', 'img', 'mosaic'])
+    parser.add_argument('--replaceimg', default='replace_img.png')
+    parser.add_argument('--mosaicsize', default=20, type=int, metavar='width')
+    parser.add_argument('--keep-audio', '-k', default=False, action='store_true')
+    parser.add_argument('--ffmpeg-config', default={"codec": "libx264"}, type=json.loads)
+    parser.add_argument('--backend', default='auto', choices=['auto', 'onnxrt', 'opencv'])
+    parser.add_argument('--execution-provider', '--ep', default=None, metavar='EP')
+    parser.add_argument('--version', action='version', version=importlib.metadata.version('deface'))
+    parser.add_argument('--keep-metadata', '-m', default=False, action='store_true')
+
+    # --- new allow-list arguments ---
     parser.add_argument(
-        '--thresh', '-t', default=0.2, type=float, metavar='T',
-        help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
+        '--allow-faces', default=None, metavar='DIR',
+        help='Path to a folder of reference images for faces that should NOT be blurred.')
     parser.add_argument(
-        '--scale', '-s', default=None, metavar='WxH',
-        help='Downscale images for network inference to this size (format: WxH, example: --scale 640x360).')
+        '--allow-threshold', default=0.4, type=float, metavar='A',
+        help='Cosine similarity threshold for the allow-list (higher = stricter). Default: 0.4.')
     parser.add_argument(
-        '--preview', '-p', default=False, action='store_true',
-        help='Enable live preview GUI (can decrease performance).')
-    parser.add_argument(
-        '--boxes', default=False, action='store_true',
-        help='Use boxes instead of ellipse masks.')
-    parser.add_argument(
-        '--draw-scores', default=False, action='store_true',
-        help='Draw detection scores onto outputs.')
-    parser.add_argument(
-        '--disable-progress-output', default=False, action='store_true',
-        help='Disable video progress output to console.')
-    parser.add_argument(
-        '--mask-scale', default=1.3, type=float, metavar='M',
-        help='Scale factor for face masks, to make sure that masks cover the complete face. Default: 1.3.')
-    parser.add_argument(
-        '--replacewith', default='blur', choices=['blur', 'solid', 'none', 'img', 'mosaic'],
-        help='Anonymization filter mode for face regions. "blur" applies a strong gaussian blurring, "solid" draws a solid black box, "none" does leaves the input unchanged, "img" replaces the face with a custom image and "mosaic" replaces the face with mosaic. Default: "blur".')
-    parser.add_argument(
-        '--replaceimg', default='replace_img.png',
-        help='Anonymization image for face regions. Requires --replacewith img option.')
-    parser.add_argument(
-        '--mosaicsize', default=20, type=int, metavar='width',
-        help='Setting the mosaic size. Requires --replacewith mosaic option. Default: 20.')
-    parser.add_argument(
-        '--keep-audio', '-k', default=False, action='store_true',
-        help='Keep audio from video source file and copy it over to the output (only applies to videos).')
-    parser.add_argument(
-        '--ffmpeg-config', default={"codec": "libx264"}, type=json.loads,
-        help='FFMPEG config arguments for encoding output videos. This argument is expected in JSON notation. For a list of possible options, refer to the ffmpeg-imageio docs. Default: \'{"codec": "libx264"}\'.'
-    )  # See https://imageio.readthedocs.io/en/stable/format_ffmpeg.html#parameters-for-saving
-    parser.add_argument(
-        '--backend', default='auto', choices=['auto', 'onnxrt', 'opencv'],
-        help='Backend for ONNX model execution. Default: "auto" (prefer onnxrt if available).')
-    parser.add_argument(
-        '--execution-provider', '--ep', default=None, metavar='EP',
-        help='Override onnxrt execution provider (see https://onnxruntime.ai/docs/execution-providers/). If not specified, the presumably fastest available one will be automatically selected. Only used if backend is onnxrt.')
-    parser.add_argument(
-        '--version', action='version', version=__version__,
-        help='Print version number and exit.')
-    parser.add_argument(
-        '--keep-metadata', '-m', default=False, action='store_true',
-        help='Keep metadata of the original image. Default : False.')
-    parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
+        '--verbose', '-v', default=False, action='store_true',
+        help='Print allow-list similarity scores for each detected face.')
+
+    parser.add_argument('--help', '-h', action='help')
 
     args = parser.parse_args()
 
@@ -333,7 +474,7 @@ def parse_cli_args():
         print('\nPlease supply at least one input path.')
         exit(1)
 
-    if args.input == ['cam']:  # Shortcut for webcam demo with live preview
+    if args.input == ['cam']:
         args.input = ['<video0>']
         args.preview = True
 
@@ -344,17 +485,13 @@ def main():
     args = parse_cli_args()
     ipaths = []
 
-    # add files in folders
     for path in args.input:
         if os.path.isdir(path):
             for file in os.listdir(path):
-                ipaths.append(os.path.join(path,file))
+                ipaths.append(os.path.join(path, file))
         else:
-            # Either a path to a regular file, the special 'cam' shortcut
-            # or an invalid path. The latter two cases are handled below.
             ipaths.append(path)
 
-    
     base_opath = args.output
     replacewith = args.replacewith
     enable_preview = args.preview
@@ -375,12 +512,21 @@ def main():
     if in_shape is not None:
         w, h = in_shape.split('x')
         in_shape = int(w), int(h)
-    if replacewith == "img":
+    if replacewith == 'img':
         replaceimg = imageio.imread(args.replaceimg)
         print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
 
+    # --- build allow-list embeddings (if requested) ---
+    allowed_embeddings = None
+    rec_model = None
 
-    # TODO: scalar downscaling setting (-> in_shape), preserving aspect ratio
+    if args.allow_faces:
+        print('[allow-list] Initialising InsightFace...')
+        face_app, rec_model = build_face_app()
+        allowed_embeddings = build_allowed_embeddings(args.allow_faces, face_app, rec_model)
+        if allowed_embeddings is not None:
+            print(f'[allow-list] {len(allowed_embeddings)} reference face(s) loaded.')
+
     centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
 
     multi_file = len(ipaths) > 1
@@ -400,39 +546,32 @@ def main():
         print(f'Input:  {ipath}\nOutput: {opath}')
         if opath is None and not enable_preview:
             print('No output file is specified and the preview GUI is disabled. No output will be produced.')
+
         if filetype == 'video' or is_cam:
             video_detect(
-                ipath=ipath,
-                opath=opath,
-                centerface=centerface,
-                threshold=threshold,
-                cam=is_cam,
-                replacewith=replacewith,
-                mask_scale=mask_scale,
-                ellipse=ellipse,
-                draw_scores=draw_scores,
-                enable_preview=enable_preview,
-                nested=multi_file,
-                keep_audio=keep_audio,
-                ffmpeg_config=ffmpeg_config,
-                replaceimg=replaceimg,
-                mosaicsize=mosaicsize,
-                disable_progress_output=disable_progress_output
+                ipath=ipath, opath=opath, centerface=centerface,
+                threshold=threshold, cam=is_cam, replacewith=replacewith,
+                mask_scale=mask_scale, ellipse=ellipse, draw_scores=draw_scores,
+                enable_preview=enable_preview, nested=multi_file,
+                keep_audio=keep_audio, ffmpeg_config=ffmpeg_config,
+                replaceimg=replaceimg, mosaicsize=mosaicsize,
+                disable_progress_output=disable_progress_output,
+                allowed_embeddings=allowed_embeddings,
+                rec_model=rec_model,
+                allow_threshold=args.allow_threshold,
+                verbose=args.verbose,
             )
         elif filetype == 'image':
             image_detect(
-                ipath=ipath,
-                opath=opath,
-                centerface=centerface,
-                threshold=threshold,
-                replacewith=replacewith,
-                mask_scale=mask_scale,
-                ellipse=ellipse,
-                draw_scores=draw_scores,
-                enable_preview=enable_preview,
-                keep_metadata=keep_metadata,
-                replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                ipath=ipath, opath=opath, centerface=centerface,
+                threshold=threshold, replacewith=replacewith,
+                mask_scale=mask_scale, ellipse=ellipse, draw_scores=draw_scores,
+                enable_preview=enable_preview, keep_metadata=keep_metadata,
+                replaceimg=replaceimg, mosaicsize=mosaicsize,
+                allowed_embeddings=allowed_embeddings,
+                rec_model=rec_model,
+                allow_threshold=args.allow_threshold,
+                verbose=args.verbose,
             )
         elif filetype is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')
