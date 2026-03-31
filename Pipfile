@@ -1,0 +1,17 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+numpy = "<2"
+onnxruntime = "*"
+onnx = "==1.16.0"
+ml-dtypes = "==0.3.2"
+insightface = "*"
+opencv-python = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
