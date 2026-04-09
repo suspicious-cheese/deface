@@ -25,16 +25,36 @@ import importlib.metadata
 # Allowed-face helpers
 # ---------------------------------------------------------------------------
 
-def build_face_app() -> FaceAnalysis:
-    """Create and prepare an InsightFace FaceAnalysis app."""
+def build_face_app():
+    """
+    Returns (app, rec_model):
+    - app: FaceAnalysis used for reference image embedding at startup
+    - rec_model: the recognition model used directly on crops at runtime,
+      bypassing InsightFace's internal detector (which fails on small crops)
+    """
+    import os
+    import insightface.model_zoo as model_zoo
+
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
-    return app
+
+    # Find the recognition model that was downloaded as part of buffalo_l
+    rec_model = None
+    for model in app.models.values():
+        if hasattr(model, 'taskname') and model.taskname == 'recognition':
+            rec_model = model
+            break
+
+    if rec_model is None:
+        raise RuntimeError('[allow-list] Could not find recognition model in buffalo_l pack.')
+
+    return app, rec_model
 
 
 def build_allowed_embeddings(
     allowed_faces_dir: str,
     face_app: FaceAnalysis,
+    rec_model,
 ) -> Optional[np.ndarray]:
     """
     Load every image in *allowed_faces_dir*, extract one face embedding per
@@ -65,8 +85,15 @@ def build_allowed_embeddings(
         if not faces:
             print(f'[allow-list] No face detected in {p}, skipping.')
             continue
+        # Use the largest detected face, crop and embed via rec_model directly
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        embeddings.append(face.normed_embedding)
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+        crop = cv2.resize(img[y1:y2, x1:x2], (112, 112))
+        emb = rec_model.get_feat(crop)
+        emb = (emb / np.linalg.norm(emb)).flatten()
+        embeddings.append(emb)
         print(f'[allow-list] Loaded reference face from {os.path.basename(p)}')
 
     if not embeddings:
@@ -76,27 +103,17 @@ def build_allowed_embeddings(
     return np.stack(embeddings)  # (N, 512)
 
 
-def pad_to_min_size(img: np.ndarray, min_size: int = 320) -> np.ndarray:
-    """Pad image with black borders so its smallest side is at least min_size.
-    InsightFace's internal detector needs a reasonably large image."""
-    h, w = img.shape[:2]
-    if h >= min_size and w >= min_size:
-        return img
-    scale = min_size / min(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    return cv2.resize(img, (new_w, new_h))
-
-
 def is_allowed_face(
     face_crop: np.ndarray,
     allowed_embeddings: np.ndarray,
-    face_app: FaceAnalysis,
+    rec_model,
     threshold: float = 0.4,
     verbose: bool = False,
 ) -> bool:
     """
     Return True if *face_crop* (H×W×3 uint8 RGB) matches any allowed face.
-    Pads small crops so InsightFace's internal detector can find the face.
+    Uses the recognition model directly on the crop — bypasses InsightFace's
+    internal detector, which fails on small or tight crops.
     """
     if face_crop.size == 0:
         return False
@@ -104,17 +121,12 @@ def is_allowed_face(
     # InsightFace expects BGR; frame is RGB (imageio convention)
     bgr_crop = face_crop[:, :, ::-1].copy()
 
-    # Upscale if too small for InsightFace's detector
-    bgr_crop = pad_to_min_size(bgr_crop, min_size=320)
+    # Recognition model expects 112x112
+    resized = cv2.resize(bgr_crop, (112, 112))
 
-    faces = face_app.get(bgr_crop)
-    if not faces:
-        if verbose:
-            print(f'[allow-list] No face found in crop, will blur.')
-        return False
-
-    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-    emb = face.normed_embedding
+    emb = rec_model.get_feat(resized)  # (1, 512)
+    emb = emb / np.linalg.norm(emb)   # normalise to unit vector
+    emb = emb.flatten()               # (512,)
 
     sims = allowed_embeddings @ emb
     best = float(sims.max())
@@ -200,7 +212,7 @@ def anonymize_frame(
         replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
         # new allow-list params (all optional — backwards compatible)
         allowed_embeddings: Optional[np.ndarray] = None,
-        face_app=None,
+        rec_model=None,
         allow_threshold: float = 0.4,
         verbose: bool = False,
 ):
@@ -215,10 +227,8 @@ def anonymize_frame(
             rx2 = min(frame.shape[1] - 1, x2)
             ry2 = min(frame.shape[0] - 1, y2)
             face_crop = frame[ry1:ry2, rx1:rx2]
-            if verbose:
-                print(f'[allow-list] Checking face crop size: {face_crop.shape}')
             if is_allowed_face(
-                face_crop, allowed_embeddings, face_app, allow_threshold, verbose
+                face_crop, allowed_embeddings, rec_model, allow_threshold, verbose
             ):
                 continue  # skip — this is an allowed face
         # ----------------------------------------------------------------
@@ -264,7 +274,7 @@ def video_detect(
         mosaicsize: int = 20,
         disable_progress_output=False,
         allowed_embeddings=None,
-        face_app=None,
+        rec_model=None,
         allow_threshold: float = 0.4,
         verbose: bool = False,
 ):
@@ -312,7 +322,7 @@ def video_detect(
             draw_scores=draw_scores, replaceimg=replaceimg,
             mosaicsize=mosaicsize,
             allowed_embeddings=allowed_embeddings,
-            face_app=face_app,
+            rec_model=rec_model,
             allow_threshold=allow_threshold,
             verbose=verbose,
         )
@@ -347,7 +357,7 @@ def image_detect(
         replaceimg=None,
         mosaicsize: int = 20,
         allowed_embeddings=None,
-        face_app=None,
+        rec_model=None,
         allow_threshold: float = 0.4,
         verbose: bool = False,
 ):
@@ -364,7 +374,7 @@ def image_detect(
         draw_scores=draw_scores, replaceimg=replaceimg,
         mosaicsize=mosaicsize,
         allowed_embeddings=allowed_embeddings,
-        face_app=face_app,
+        rec_model=rec_model,
         allow_threshold=allow_threshold,
     )
 
@@ -508,13 +518,12 @@ def main():
 
     # --- build allow-list embeddings (if requested) ---
     allowed_embeddings = None
-    allowed_embeddings = None
-    face_app = None
+    rec_model = None
 
     if args.allow_faces:
         print('[allow-list] Initialising InsightFace...')
-        face_app = build_face_app()
-        allowed_embeddings = build_allowed_embeddings(args.allow_faces, face_app)
+        face_app, rec_model = build_face_app()
+        allowed_embeddings = build_allowed_embeddings(args.allow_faces, face_app, rec_model)
         if allowed_embeddings is not None:
             print(f'[allow-list] {len(allowed_embeddings)} reference face(s) loaded.')
 
@@ -548,7 +557,7 @@ def main():
                 replaceimg=replaceimg, mosaicsize=mosaicsize,
                 disable_progress_output=disable_progress_output,
                 allowed_embeddings=allowed_embeddings,
-                face_app=face_app,
+                rec_model=rec_model,
                 allow_threshold=args.allow_threshold,
                 verbose=args.verbose,
             )
@@ -560,7 +569,7 @@ def main():
                 enable_preview=enable_preview, keep_metadata=keep_metadata,
                 replaceimg=replaceimg, mosaicsize=mosaicsize,
                 allowed_embeddings=allowed_embeddings,
-                face_app=face_app,
+                rec_model=rec_model,
                 allow_threshold=args.allow_threshold,
                 verbose=args.verbose,
             )

@@ -3,6 +3,8 @@ test-media/
 allowed/
 .DS_Store
 test.py
+deface.py
+deface2.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
